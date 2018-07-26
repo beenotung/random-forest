@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "ml-dataset-iris": "^1.0.0",
+    "ml-random-forest": "^1.0.3"
+  }
+}

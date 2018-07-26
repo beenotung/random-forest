@@ -38,8 +38,14 @@ function mapmap_get<K, V>(map: Map<K, Map<K, V> | V>, ks: K[]): V {
     return mapmap_lastmap(map, ks).get(ks[ks.length - 1]);
 }
 
-class TreeNode<X, L> {
+export abstract class TreeNode<X, L> {
+    abstract predict(xs: X[]): TreeNode<X, L> | L ;
+}
+
+
+class DeterministicTreeNode<X, L> extends TreeNode<X, L> {
     constructor(public featureIdx: number, public mapping: Map<X, L | TreeNode<X, L>>) {
+        super();
     }
 
     predict(xs: X[]): TreeNode<X, L> | L {
@@ -47,18 +53,47 @@ class TreeNode<X, L> {
     }
 }
 
-class DecisionTree<X, L> {
+class ProbabilityTreeNode<X, L> extends TreeNode<X, L> {
+    label_probs: Array<[L, number]>;
+
+    constructor(label_counts: Array<[L, number]>) {
+        super();
+        let sum = label_counts.reduce((acc, [label, count]) => acc + count, 0);
+        let label_probs: Array<[L, number]> = [];
+        let prob = 0;
+        for (const [label, count] of label_counts) {
+            prob += count / sum;
+            label_probs.push([label, prob]);
+        }
+        label_probs.sort(((a, b) => compare(a[1], b[1])));
+        this.label_probs = label_probs;
+    }
+
+    predict(xs: X[]): TreeNode<X, L> | L {
+        let nonce = Math.random();
+        for (const [label, prob] of this.label_probs) {
+            if (nonce < prob) {
+                return label;
+            }
+        }
+        console.error({nonce, labels: this.label_probs});
+        throw new Error('failed to predict label');
+    }
+}
+
+export class DecisionTree<X, L> {
     constructor(public rootNode: TreeNode<X, L>) {
     }
 
     predict(xs: X[]): L {
-        let res = this.rootNode.predict(xs);
+        let acc = this.rootNode;
         for (; ;) {
+            let res = acc.predict(xs);
             if (res instanceof TreeNode) {
-                res = res.predict(xs);
-            } else {
-                return res;
+                acc = res;
+                continue;
             }
+            return res;
         }
     }
 }
@@ -115,10 +150,12 @@ function cloneArray<A>(xs: A[]): A[] {
  *
  * select feature of lowest impurity
  * */
-function buildTreeNode<X, L>(xss: [][], labels: L[], training_idxs: number[], feature_idx_pool: number[], m_feature: number): TreeNode<X, L> {
+function buildTreeNode<X, L>(xss: X[][], labels: L[], training_idxs: number[], feature_idx_pool: number[], m_feature: number): TreeNode<X, L> {
     if (feature_idx_pool.length < 1) {
         throw new Error('expect at least one feature in the pool');
     }
+    // console.debug(`building tree node: ${xss[0].length - feature_idx_pool.length}/${xss[0].length}`);
+    // console.debug(`building tree node`, {level}, level_stack);
     feature_idx_pool = cloneArray(feature_idx_pool);
     let n = labels.length;
     let selected_feature_idxs = random_select(feature_idx_pool, m_feature);
@@ -133,10 +170,8 @@ function buildTreeNode<X, L>(xss: [][], labels: L[], training_idxs: number[], fe
         }
     }
     /**
-     * Array<[feature idx, impurity]>
+     * Array<[feature idx, weighted gini impurity]>
      * */
-    let featureidx_featurevalue_impurity;
-    let feature_impurity_list: Array<[number, number]> = [];
     let featureIdx_weightedImpurities: Array<[number, number]> = [];
     for (let feature_idx of selected_feature_idxs) {
         let label_counts = feature_label_counts.get(feature_idx);
@@ -167,6 +202,7 @@ function buildTreeNode<X, L>(xss: [][], labels: L[], training_idxs: number[], fe
 
     featureIdx_weightedImpurities.sort((a, b) => compare(a[1], b[1]));
     let [selected_feature_idx, weighted_impurity] = featureIdx_weightedImpurities[0];
+    // console.debug('select idx', selected_feature_idx, 'with impurity of', weighted_impurity);
 
     /* add back other features to the pool */
     for (let idx of selected_feature_idxs) {
@@ -179,8 +215,21 @@ function buildTreeNode<X, L>(xss: [][], labels: L[], training_idxs: number[], fe
     feature_label_counts.get(selected_feature_idx).forEach((label_count, feature) => {
         if (label_count.size > 1) {
             /* not sure */
-            let child = buildTreeNode<X, L>(xss, labels, training_idxs, feature_idx_pool, m_feature);
-            mapping.set(feature, child);
+            if (feature_idx_pool.length > 0) {
+                /* pass to next level */
+                // let stack = cloneArray(level_stack);
+                // stack.push(level);
+                let child = buildTreeNode<X, L>(xss, labels, training_idxs, feature_idx_pool, m_feature);
+                mapping.set(feature, child);
+            } else {
+                /* no more level, guess it */
+                let label_counts: Array<[L, number]> = [];
+                label_count.forEach((count, label) => {
+                    label_counts.push([label, count]);
+                });
+                let child = new ProbabilityTreeNode(label_counts);
+                mapping.set(feature, child);
+            }
         } else {
             /* sure, should be only 1 label */
             label_count.forEach((count, label) => {
@@ -188,10 +237,10 @@ function buildTreeNode<X, L>(xss: [][], labels: L[], training_idxs: number[], fe
             });
         }
     });
-    return new TreeNode<X, L>(selected_feature_idx, mapping);
+    return new DeterministicTreeNode<X, L>(selected_feature_idx, mapping);
 }
 
-class RandomForest<X, L> {
+export class RandomForest<X, L> {
     trees: DecisionTree<X, L>[];
 
     constructor(public nTree: number, public mFeature: number) {
@@ -200,66 +249,46 @@ class RandomForest<X, L> {
     train(xss: X[][], labels: L[], train_idxs: number[], test_idxs: number[]) {
         this.trees = new Array(this.nTree);
         for (let n = 0; n < this.nTree; n++) {
-            let tree: DecisionTree<X> =;
-            let feature_idx_pool = gen_range(0, xss[0].length);
-            let selected_feature_idxs = random_select(feature_idx_pool, this.mFeature);
-
-            let decision_count: decision_count<X, L> = new Map();
-
-            let features = new Set<X>();
-            for (let i = 0; i < train_idxs.length; i++) {
-                let idx = train_idxs[i];
-                let xs = xss[idx];
-                let label = labels[idx];
-                for (let j = 0; j < selected_feature_idxs.length; j++) {
-                    let feature_idx = selected_feature_idxs[j];
-                    let feature_value: X = xs[feature_idx];
-                    features.add(feature_value);
-                    inc_feature_label(decision_count, feature_value, label);
-                }
-            }
-            /**
-             * feature -> [population of leaf, gini impurity]
-             * */
-            let gini_impurity = new Map<X, [number, number]>();
-            let total_population = 0;
-            features.forEach(feature => {
-                let impurity = 1;
-                let leaf_population = 0;
-                decision_count.get(feature).forEach((count, label) => {
-                    leaf_population += count;
-                });
-                total_population += leaf_population;
-                decision_count.get(feature).forEach((count, label) => {
-                    let prob = count / leaf_population;
-                    impurity -= prob * prob;
-                });
-                gini_impurity.set(feature, [leaf_population, impurity]);
-            });
-            /**
-             * weight the gini impurity
-             * Array<[feature, impurity]>
-             * */
-            let weighted_gini_impurity: Array<[X, number]> = [];
-            gini_impurity.forEach(([leaf_population, impurity], feature) => {
-                let weighted_impurity = impurity * leaf_population / total_population;
-                weighted_gini_impurity.push([feature, weighted_impurity]);
-            });
-            weighted_gini_impurity.sort((a, b) => compare(a[1], b[1]));
-            let best_feature = weighted_gini_impurity[0][0];
-
-            this.trees.push(tree);
+            console.debug(`building forest: ${n + 1}/${this.nTree}`);
+            let feature_idx_pool = gen_range(0, xss[0].length - 1);
+            let rootNode = buildTreeNode(xss, labels, train_idxs, feature_idx_pool, this.mFeature);
+            this.trees[n] = new DecisionTree<X, L>(rootNode);
         }
+        // TODO test against test_idxs, adjust mFeature
     }
 
-    batchPredict() {
+    /**
+     * @return Array<[Label, Probability]>
+     * */
+    batchPredict(xss: X[][]): Array<[L, number]> {
+        return xss.map(xs => this.predict(xs));
     }
 
-    predict(x) {
+    /**
+     * @return [Label, Probability]
+     * */
+    predict(xs: X[]): [L, number] {
+        let label_count: Map<L, number> = new Map();
+        for (const tree of this.trees) {
+            let label = tree.predict(xs);
+            let count = 1;
+            if (label_count.has(label)) {
+                count += label_count.get(label);
+            }
+            label_count.set(label, count);
+        }
+        let sorted_label_count: Array<[L, number]> = [];
+        label_count.forEach(((count, label) => {
+            sorted_label_count.push([label, count]);
+        }));
+        sorted_label_count.sort((a, b) => compare(a[1], b[1]));
+        let [label, count] = sorted_label_count[sorted_label_count.length - 1];
+        let prob = count / this.nTree;
+        return [label, prob];
     }
 }
 
-function select_idx_for_training(n: number): [number[], number[]] {
+export function select_idx_for_training(n: number): [number[], number[]] {
     let used: { [k: number]: boolean } = {};
     let train: number[] = new Array(n);
     let test: number[] = [];
